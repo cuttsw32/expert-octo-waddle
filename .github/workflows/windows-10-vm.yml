@@ -1,4 +1,4 @@
-name: Windows 10 VM (noVNC + RDP via ngrok)
+name: Windows 10 VM - DIRECT RDP ONLY (No Web)
 
 on:
   workflow_dispatch:
@@ -12,154 +12,113 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Check KVM & System Resources
-        run: |
-          echo "=== System Info ==="
-          ls -l /dev/kvm || echo "❌ /dev/kvm NOT found (will use slow emulation)"
-          free -h
-          echo "==================="
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq jq curl wget
-          echo "✅ Dependencies installed"
-
       - name: Install ngrok
         run: |
           curl -s https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
           echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/sources.list.d/ngrok.list
           sudo apt update -qq
-          sudo apt install -y -qq ngrok
+          sudo apt install -y -qq ngrok jq
           ngrok config add-authtoken ${{ secrets.NGROK_AUTHTOKEN }}
-          echo "✅ ngrok installed and configured"
 
-      - name: Clone & Build Windows 10 VM
+      - name: Start Windows 10 with DIRECT RDP
         run: |
-          git clone https://github.com/hopingboyz/windows10vm.git
-          cd windows10vm
-          docker build -t windows10-vm .
+          docker rm -f win10-rdp 2>/dev/null || true
 
-      - name: Start Windows 10 VM Container
-        run: |
-          docker rm -f windows10-vm 2>/dev/null || true
-
-          docker run -d --name windows10-vm \
+          # dockurr/windows - Best for direct RDP performance
+          docker run -d --name win10-rdp \
             --device /dev/kvm \
-            -p 6080:6080 \
             -p 3389:3389 \
-            -v windows_data:/data \
-            -v windows_iso:/iso \
-            --memory=6g \
-            --cpus=4 \
-            -e MEMORY=6G \
-            -e CPU_CORES=4 \
-            windows10-vm
+            -e VERSION="win10" \
+            -e USERNAME="RDP" \
+            -e PASSWORD="RdpPass123!" \
+            -e DISK_SIZE="100G" \
+            -e RAM_SIZE="6G" \
+            -e CPU_CORES="4" \
+            -e DISABLE_WEB="true" \
+            dockurr/windows
 
-          echo "✅ Container started"
-          sleep 20
-          docker ps | grep windows10-vm
+          echo "✅ Windows 10 started with direct RDP only"
+          sleep 25
 
-      - name: Start ngrok tunnels
+      - name: Start ngrok RDP Tunnel Only
         run: |
-          echo "🚀 Starting ngrok tunnels..."
+          echo "Starting ngrok TCP tunnel for RDP only..."
 
-          rm -f /tmp/ngrok-*.log
-
-          # Start noVNC tunnel
-          ngrok http 6080 \
-            --log=stdout \
-            --log-level=info \
-            --region=us > /tmp/ngrok-novnc.log 2>&1 &
-          sleep 3
-
-          # Start RDP tunnel
           ngrok tcp 3389 \
             --log=stdout \
-            --log-level=info \
             --region=us > /tmp/ngrok-rdp.log 2>&1 &
 
-          echo "Waiting for ngrok API (up to 90 seconds)..."
+          sleep 8
 
-          NGROK_READY=false
-          for i in {1..45}; do
-            if curl -s --max-time 3 http://127.0.0.1:4040/api/tunnels >/dev/null 2>&1; then
-              NGROK_READY=true
-              echo "✅ ngrok API ready after $((i*2)) seconds"
+          for i in {1..25}; do
+            if curl -s http://127.0.0.1:4040/api/tunnels > /dev/null 2>&1; then
               break
             fi
             sleep 2
           done
 
-          if [ "$NGROK_READY" = false ]; then
-            echo "❌ ngrok failed to start. Debug info:"
-            echo "=== noVNC log ==="
-            tail -n 60 /tmp/ngrok-novnc.log || echo "No log"
-            echo "=== RDP log ==="
-            tail -n 60 /tmp/ngrok-rdp.log || echo "No log"
-            echo "=== Processes ==="
-            ps aux | grep -E '[n]grok' || true
-            exit 1
-          fi
-
-          sleep 8
-
-          echo "Fetching public URLs..."
           TUNNELS=$(curl -s http://127.0.0.1:4040/api/tunnels)
-
-          NOVNC_URL=$(echo "$TUNNELS" | jq -r '.tunnels[]? | select(.proto=="https") | .public_url' | head -1)
           RDP_URL=$(echo "$TUNNELS" | jq -r '.tunnels[]? | select(.proto=="tcp") | .public_url' | head -1)
 
-          if [ -z "$NOVNC_URL" ] || [ "$NOVNC_URL" = "null" ]; then
-            NOVNC_URL=$(echo "$TUNNELS" | jq -r '.tunnels[0].public_url // "NOT_FOUND"')
-          fi
           if [ -z "$RDP_URL" ] || [ "$RDP_URL" = "null" ]; then
-            RDP_URL=$(echo "$TUNNELS" | jq -r '.tunnels[1].public_url // "NOT_FOUND"')
+            RDP_URL=$(echo "$TUNNELS" | jq -r '.tunnels[0].public_url // "NOT_FOUND"')
           fi
 
-          echo "NOVNC_URL=$NOVNC_URL" >> $GITHUB_ENV
+          RDP_HOST=$(echo "$RDP_URL" | sed 's|tcp://||')
+
           echo "RDP_URL=$RDP_URL" >> $GITHUB_ENV
+          echo "RDP_HOST=$RDP_HOST" >> $GITHUB_ENV
 
-          echo "✅ ngrok tunnels started!"
-          echo "🌐 noVNC: $NOVNC_URL"
-          echo "🖥️  RDP:   $RDP_URL"
+          echo "✅ RDP Tunnel ready"
+          echo "RDP: $RDP_URL"
 
-          echo "=== Raw tunnels (debug) ==="
-          echo "$TUNNELS" | head -c 700
-
-      - name: Wait for VM services
+      - name: Wait for Windows Boot
         run: |
-          echo "Waiting for noVNC..."
-          for i in {1..60}; do
-            if curl -s --max-time 5 http://localhost:6080 >/dev/null 2>&1; then
-              echo "✅ noVNC responding"
-              break
-            fi
-            sleep 15
-          done
+          echo "Waiting for Windows to boot (15-30 mins first time)..."
+          sleep 180   # Give Windows time to boot properly
+          echo "Windows should be ready for direct RDP now"
 
-      - name: Show Access Information
+      - name: Show DIRECT RDP Details (No Web)
         run: |
           echo ""
-          echo "=========================================="
-          echo "   🖥️  WINDOWS 10 VM READY"
-          echo "=========================================="
+          echo "═══════════════════════════════════════════════════════════════"
+          echo "           ✅ FULLY READY - DIRECT RDP ONLY"
+          echo "═══════════════════════════════════════════════════════════════"
           echo ""
-          echo "🌐 noVNC (Browser):"
-          echo "   ${{ env.NOVNC_URL }}"
+          echo "🔗 RDP COMPUTER / HOST:"
+          echo "   ${{ env.RDP_HOST }}"
           echo ""
-          echo "🖥️  RDP:"
-          echo "   ${{ env.RDP_URL }}"
+          echo "👤 USERNAME:"
+          echo "   RDP"
           echo ""
-          echo "📌 Username: Administrator"
-          echo "   Password: (blank) / admin / 123456 / password"
-          echo "=========================================="
+          echo "🔑 PASSWORD:"
+          echo "   RdpPass123!"
+          echo ""
+          echo "───────────────────────────────────────────────────────────────"
+          echo "📌 HOW TO CONNECT (Direct RDP - No Web):"
+          echo ""
+          echo "   Windows:"
+          echo "     1. Open 'Remote Desktop Connection'"
+          echo "     2. Paste exactly: ${{ env.RDP_HOST }}"
+          echo "     3. Username: RDP"
+          echo "     4. Password: RdpPass123!"
+          echo "     5. Click Connect"
+          echo ""
+          echo "   Mac / Android / iPhone:"
+          echo "     Use Microsoft Remote Desktop app"
+          echo "     Paste the address above"
+          echo ""
+          echo "───────────────────────────────────────────────────────────────"
+          echo "⚠️  First run only: May take 15-30 minutes to boot"
+          echo "   After first setup, RDP connects very fast"
+          echo ""
+          echo "💡 This is PURE RDP - no web interface used"
+          echo "═══════════════════════════════════════════════════════════════"
 
-      - name: Keep VM Alive
+      - name: Keep Alive
         run: |
-          echo "🔄 VM running. Cancel workflow to stop."
+          echo "🔄 Direct RDP Windows 10 is running"
           while true; do
-            echo "[$(date '+%H:%M:%S')] Windows 10 VM Active"
-            docker ps --filter name=windows10-vm --format "Status: {{.Status}}" || true
+            echo "[$(date '+%H:%M:%S')] RDP Active: ${{ env.RDP_HOST }}"
             sleep 300
           done
