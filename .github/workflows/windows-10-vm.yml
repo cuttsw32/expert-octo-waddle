@@ -15,7 +15,7 @@ jobs:
       - name: Check KVM & System Resources
         run: |
           echo "=== System Info ==="
-          ls -l /dev/kvm || echo "❌ /dev/kvm NOT found (KVM acceleration unavailable - will be slow)"
+          ls -l /dev/kvm || echo "❌ /dev/kvm NOT found (will use slow emulation)"
           free -h
           echo "==================="
 
@@ -34,7 +34,7 @@ jobs:
           ngrok config add-authtoken ${{ secrets.NGROK_AUTHTOKEN }}
           echo "✅ ngrok installed and configured"
 
-      - name: Clone windows10vm repo & Build Docker image
+      - name: Clone & Build Windows 10 VM
         run: |
           git clone https://github.com/hopingboyz/windows10vm.git
           cd windows10vm
@@ -57,53 +57,82 @@ jobs:
             windows10-vm
 
           echo "✅ Container started"
-          sleep 25
+          sleep 20
           docker ps | grep windows10-vm
 
       - name: Start ngrok tunnels
         run: |
-          echo "Starting ngrok tunnels..."
-          
-          nohup ngrok http 6080 --log=stdout > /tmp/ngrok-novnc.log 2>&1 &
-          nohup ngrok tcp 3389 --log=stdout > /tmp/ngrok-rdp.log 2>&1 &
-          
-          sleep 12
-          
-          echo "Fetching public URLs from ngrok..."
-          
-          for i in {1..20}; do
-            if curl -s http://127.0.0.1:4040/api/tunnels > /dev/null 2>&1; then
-              echo "ngrok API is ready"
+          echo "🚀 Starting ngrok tunnels..."
+
+          rm -f /tmp/ngrok-*.log
+
+          # Start noVNC tunnel
+          ngrok http 6080 \
+            --log=stdout \
+            --log-level=info \
+            --region=us > /tmp/ngrok-novnc.log 2>&1 &
+          sleep 3
+
+          # Start RDP tunnel
+          ngrok tcp 3389 \
+            --log=stdout \
+            --log-level=info \
+            --region=us > /tmp/ngrok-rdp.log 2>&1 &
+
+          echo "Waiting for ngrok API (up to 90 seconds)..."
+
+          NGROK_READY=false
+          for i in {1..45}; do
+            if curl -s --max-time 3 http://127.0.0.1:4040/api/tunnels >/dev/null 2>&1; then
+              NGROK_READY=true
+              echo "✅ ngrok API ready after $((i*2)) seconds"
               break
             fi
             sleep 2
           done
-          
+
+          if [ "$NGROK_READY" = false ]; then
+            echo "❌ ngrok failed to start. Debug info:"
+            echo "=== noVNC log ==="
+            tail -n 60 /tmp/ngrok-novnc.log || echo "No log"
+            echo "=== RDP log ==="
+            tail -n 60 /tmp/ngrok-rdp.log || echo "No log"
+            echo "=== Processes ==="
+            ps aux | grep -E '[n]grok' || true
+            exit 1
+          fi
+
+          sleep 8
+
+          echo "Fetching public URLs..."
           TUNNELS=$(curl -s http://127.0.0.1:4040/api/tunnels)
-          
-          NOVNC_URL=$(echo "$TUNNELS" | jq -r '.tunnels[] | select(.proto=="https") | .public_url' | head -1)
-          RDP_URL=$(echo "$TUNNELS" | jq -r '.tunnels[] | select(.proto=="tcp") | .public_url' | head -1)
-          
-          if [ -z "$NOVNC_URL" ]; then
-            NOVNC_URL=$(echo "$TUNNELS" | jq -r '.tunnels[0].public_url // empty')
+
+          NOVNC_URL=$(echo "$TUNNELS" | jq -r '.tunnels[]? | select(.proto=="https") | .public_url' | head -1)
+          RDP_URL=$(echo "$TUNNELS" | jq -r '.tunnels[]? | select(.proto=="tcp") | .public_url' | head -1)
+
+          if [ -z "$NOVNC_URL" ] || [ "$NOVNC_URL" = "null" ]; then
+            NOVNC_URL=$(echo "$TUNNELS" | jq -r '.tunnels[0].public_url // "NOT_FOUND"')
           fi
-          if [ -z "$RDP_URL" ]; then
-            RDP_URL=$(echo "$TUNNELS" | jq -r '.tunnels[1].public_url // empty')
+          if [ -z "$RDP_URL" ] || [ "$RDP_URL" = "null" ]; then
+            RDP_URL=$(echo "$TUNNELS" | jq -r '.tunnels[1].public_url // "NOT_FOUND"')
           fi
-          
+
           echo "NOVNC_URL=$NOVNC_URL" >> $GITHUB_ENV
           echo "RDP_URL=$RDP_URL" >> $GITHUB_ENV
-          
-          echo "✅ ngrok tunnels started"
-          echo "noVNC: $NOVNC_URL"
-          echo "RDP: $RDP_URL"
 
-      - name: Wait for services
+          echo "✅ ngrok tunnels started!"
+          echo "🌐 noVNC: $NOVNC_URL"
+          echo "🖥️  RDP:   $RDP_URL"
+
+          echo "=== Raw tunnels (debug) ==="
+          echo "$TUNNELS" | head -c 700
+
+      - name: Wait for VM services
         run: |
-          echo "Waiting for VM services (noVNC)..."
-          for i in {1..40}; do
-            if curl -s --max-time 4 http://localhost:6080 > /dev/null 2>&1; then
-              echo "✅ noVNC is responding"
+          echo "Waiting for noVNC..."
+          for i in {1..60}; do
+            if curl -s --max-time 5 http://localhost:6080 >/dev/null 2>&1; then
+              echo "✅ noVNC responding"
               break
             fi
             sleep 15
@@ -113,37 +142,24 @@ jobs:
         run: |
           echo ""
           echo "=========================================="
-          echo "   🖥️  WINDOWS 10 VM READY (via ngrok)"
+          echo "   🖥️  WINDOWS 10 VM READY"
           echo "=========================================="
           echo ""
-          echo "🌐 noVNC (Browser - Recommended):"
+          echo "🌐 noVNC (Browser):"
           echo "   ${{ env.NOVNC_URL }}"
           echo ""
-          echo "🖥️  RDP (Remote Desktop):"
+          echo "🖥️  RDP:"
           echo "   ${{ env.RDP_URL }}"
           echo ""
-          echo "📌 Credentials (typical for this lite edition):"
-          echo "   Username: Administrator"
-          echo "   Password: (leave blank)  OR try: admin / 123456 / password"
-          echo ""
-          echo "⚠️  FIRST RUN:"
-          echo "   - Windows may be installing (20-40 minutes)"
-          echo "   - Use noVNC first to complete OOBE / create account if prompted"
-          echo "   - After setup, RDP should work"
-          echo ""
-          echo "💡 Keep this workflow running to maintain access"
+          echo "📌 Username: Administrator"
+          echo "   Password: (blank) / admin / 123456 / password"
           echo "=========================================="
 
-      - name: Maintain Connection
+      - name: Keep VM Alive
         run: |
-          echo "🔄 VM is now running."
-          echo "To stop: Cancel this workflow run in GitHub UI."
-          echo ""
-
+          echo "🔄 VM running. Cancel workflow to stop."
           while true; do
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Windows 10 VM Active"
-            echo "   noVNC: ${{ env.NOVNC_URL }}"
-            echo "   RDP:   ${{ env.RDP_URL }}"
-            docker ps --filter name=windows10-vm --format "Container: {{.Status}}" || true
+            echo "[$(date '+%H:%M:%S')] Windows 10 VM Active"
+            docker ps --filter name=windows10-vm --format "Status: {{.Status}}" || true
             sleep 300
           done
