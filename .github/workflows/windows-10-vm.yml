@@ -1,4 +1,4 @@
-name: Windows 10 VM - DIRECT RDP ONLY (No Web)
+name: Windows 10 VM - DIRECT RDP ONLY (Pinggy - Free TCP)
 
 on:
   workflow_dispatch:
@@ -12,14 +12,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install ngrok (Direct Binary)
+      - name: Install dependencies
         run: |
-          echo "Installing ngrok..."
-          curl -sSL https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz | tar xz
-          sudo mv ngrok /usr/local/bin/
-          ngrok version
-          ngrok config add-authtoken ${{ secrets.NGROK_AUTHTOKEN }}
-          echo "✅ ngrok installed"
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass openssh-client jq
 
       - name: Start Windows 10 Container
         run: |
@@ -37,75 +33,53 @@ jobs:
             -e DISABLE_WEB="true" \
             dockurr/windows
 
-          echo "✅ Container started"
-          sleep 15
+          echo "✅ Windows container started"
+          sleep 20
 
-      - name: Start ngrok TCP Tunnel (Very Robust)
+      - name: Start Pinggy TCP Tunnel (Free - No Card Needed)
         run: |
-          echo "🚀 Starting ngrok TCP tunnel for RDP..."
+          echo "🚀 Starting free Pinggy TCP tunnel for RDP..."
 
-          rm -f /tmp/ngrok.log
+          pkill -f "tcp@free.pinggy.io" || true
 
-          nohup ngrok tcp 3389 \
-            --authtoken ${{ secrets.NGROK_AUTHTOKEN }} \
-            --log=stdout \
-            --region=us > /tmp/ngrok.log 2>&1 &
+          ssh -o StrictHostKeyChecking=no -o ServerAliveInterval=60 \
+            -R 0:localhost:3389 tcp@free.pinggy.io > /tmp/pinggy.log 2>&1 &
 
-          NGROK_PID=$!
-          echo "ngrok started with PID: $NGROK_PID"
+          SSH_PID=$!
+          echo "Pinggy SSH process started"
 
-          echo "Waiting for ngrok API (up to 120 seconds)..."
+          echo "Waiting for Pinggy to give us the public address (up to 60s)..."
 
-          NGROK_READY=false
-          for i in {1..60}; do
+          RDP_HOST=""
+          for i in {1..30}; do
             sleep 2
-
-            if ! ps -p $NGROK_PID > /dev/null 2>&1; then
-              echo "ngrok process died at attempt $i"
-              break
-            fi
-
-            if curl -s --max-time 5 http://127.0.0.1:4040/api/tunnels >/dev/null 2>&1; then
-              NGROK_READY=true
-              echo "✅ ngrok API is ready after $((i*2)) seconds"
-              break
+            
+            if grep -q "tcp://" /tmp/pinggy.log 2>/dev/null; then
+              RDP_HOST=$(grep -o 'tcp://[^ ]*' /tmp/pinggy.log | head -1 | sed 's|tcp://||')
+              if [ -n "$RDP_HOST" ]; then
+                echo "✅ Got Pinggy address: $RDP_HOST"
+                break
+              fi
             fi
           done
 
-          if [ "$NGROK_READY" = false ]; then
-            echo "❌ ngrok tunnel failed to start"
-            echo ""
-            echo "=== ngrok log (last 150 lines) ==="
-            tail -n 150 /tmp/ngrok.log || echo "No log file"
-            echo ""
-            echo "=== ngrok processes ==="
-            ps aux | grep -E '[n]grok' || true
+          if [ -z "$RDP_HOST" ]; then
+            echo "❌ Failed to get Pinggy address"
+            echo "=== Pinggy log ==="
+            cat /tmp/pinggy.log
             exit 1
           fi
 
-          sleep 6
-
-          echo "Fetching public RDP address..."
-          TUNNELS=$(curl -s http://127.0.0.1:4040/api/tunnels)
-
-          RDP_URL=$(echo "$TUNNELS" | jq -r '.tunnels[]? | select(.proto=="tcp") | .public_url' | head -1)
-
-          if [ -z "$RDP_URL" ] || [ "$RDP_URL" = "null" ]; then
-            RDP_URL=$(echo "$TUNNELS" | jq -r '.tunnels[0].public_url // "NOT_FOUND"')
-          fi
-
-          RDP_HOST=$(echo "$RDP_URL" | sed 's|tcp://||')
-
-          echo "RDP_URL=$RDP_URL" >> $GITHUB_ENV
           echo "RDP_HOST=$RDP_HOST" >> $GITHUB_ENV
+          echo "RDP_URL=tcp://$RDP_HOST" >> $GITHUB_ENV
 
           echo ""
-          echo "✅ ngrok tunnel created successfully!"
-          echo "RDP Host: $RDP_HOST"
+          echo "✅ Free TCP tunnel ready!"
+          echo "RDP Address: $RDP_HOST"
 
       - name: Wait for Windows to Boot
         run: |
-          echo "⏳ Waiting for Windows to boot (15-25 mins on first run)..."
+          echo "⏳ Waiting for Windows to boot (15-25 mins first run)..."
           sleep 300
           echo "Boot wait finished"
 
@@ -113,7 +87,7 @@ jobs:
         run: |
           echo ""
           echo "═══════════════════════════════════════════════════════════════"
-          echo "           ✅ DIRECT RDP READY (No Web)"
+          echo "           ✅ DIRECT RDP READY (Free - No Web)"
           echo "═══════════════════════════════════════════════════════════════"
           echo ""
           echo "🔗 Computer:"
@@ -123,6 +97,8 @@ jobs:
           echo "🔑 Password: RdpPass123!"
           echo ""
           echo "═══════════════════════════════════════════════════════════════"
+          echo ""
+          echo "This uses Pinggy (free TCP tunnel) - no card required"
 
       - name: Keep VM Running
         run: |
