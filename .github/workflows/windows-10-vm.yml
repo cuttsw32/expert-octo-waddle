@@ -1,0 +1,149 @@
+name: Windows 10 VM (noVNC + RDP via ngrok)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  deploy-vm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check KVM & System Resources
+        run: |
+          echo "=== System Info ==="
+          ls -l /dev/kvm || echo "❌ /dev/kvm NOT found (KVM acceleration unavailable - will be slow)"
+          free -h
+          echo "==================="
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq jq curl wget
+          echo "✅ Dependencies installed"
+
+      - name: Install ngrok
+        run: |
+          curl -s https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
+          echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/sources.list.d/ngrok.list
+          sudo apt update -qq
+          sudo apt install -y -qq ngrok
+          ngrok config add-authtoken ${{ secrets.NGROK_AUTHTOKEN }}
+          echo "✅ ngrok installed and configured"
+
+      - name: Clone windows10vm repo & Build Docker image
+        run: |
+          git clone https://github.com/hopingboyz/windows10vm.git
+          cd windows10vm
+          docker build -t windows10-vm .
+
+      - name: Start Windows 10 VM Container
+        run: |
+          docker rm -f windows10-vm 2>/dev/null || true
+
+          docker run -d --name windows10-vm \
+            --device /dev/kvm \
+            -p 6080:6080 \
+            -p 3389:3389 \
+            -v windows_data:/data \
+            -v windows_iso:/iso \
+            --memory=6g \
+            --cpus=4 \
+            -e MEMORY=6G \
+            -e CPU_CORES=4 \
+            windows10-vm
+
+          echo "✅ Container started"
+          sleep 25
+          docker ps | grep windows10-vm
+
+      - name: Start ngrok tunnels
+        run: |
+          echo "Starting ngrok tunnels..."
+          
+          nohup ngrok http 6080 --log=stdout > /tmp/ngrok-novnc.log 2>&1 &
+          nohup ngrok tcp 3389 --log=stdout > /tmp/ngrok-rdp.log 2>&1 &
+          
+          sleep 12
+          
+          echo "Fetching public URLs from ngrok..."
+          
+          for i in {1..20}; do
+            if curl -s http://127.0.0.1:4040/api/tunnels > /dev/null 2>&1; then
+              echo "ngrok API is ready"
+              break
+            fi
+            sleep 2
+          done
+          
+          TUNNELS=$(curl -s http://127.0.0.1:4040/api/tunnels)
+          
+          NOVNC_URL=$(echo "$TUNNELS" | jq -r '.tunnels[] | select(.proto=="https") | .public_url' | head -1)
+          RDP_URL=$(echo "$TUNNELS" | jq -r '.tunnels[] | select(.proto=="tcp") | .public_url' | head -1)
+          
+          if [ -z "$NOVNC_URL" ]; then
+            NOVNC_URL=$(echo "$TUNNELS" | jq -r '.tunnels[0].public_url // empty')
+          fi
+          if [ -z "$RDP_URL" ]; then
+            RDP_URL=$(echo "$TUNNELS" | jq -r '.tunnels[1].public_url // empty')
+          fi
+          
+          echo "NOVNC_URL=$NOVNC_URL" >> $GITHUB_ENV
+          echo "RDP_URL=$RDP_URL" >> $GITHUB_ENV
+          
+          echo "✅ ngrok tunnels started"
+          echo "noVNC: $NOVNC_URL"
+          echo "RDP: $RDP_URL"
+
+      - name: Wait for services
+        run: |
+          echo "Waiting for VM services (noVNC)..."
+          for i in {1..40}; do
+            if curl -s --max-time 4 http://localhost:6080 > /dev/null 2>&1; then
+              echo "✅ noVNC is responding"
+              break
+            fi
+            sleep 15
+          done
+
+      - name: Show Access Information
+        run: |
+          echo ""
+          echo "=========================================="
+          echo "   🖥️  WINDOWS 10 VM READY (via ngrok)"
+          echo "=========================================="
+          echo ""
+          echo "🌐 noVNC (Browser - Recommended):"
+          echo "   ${{ env.NOVNC_URL }}"
+          echo ""
+          echo "🖥️  RDP (Remote Desktop):"
+          echo "   ${{ env.RDP_URL }}"
+          echo ""
+          echo "📌 Credentials (typical for this lite edition):"
+          echo "   Username: Administrator"
+          echo "   Password: (leave blank)  OR try: admin / 123456 / password"
+          echo ""
+          echo "⚠️  FIRST RUN:"
+          echo "   - Windows may be installing (20-40 minutes)"
+          echo "   - Use noVNC first to complete OOBE / create account if prompted"
+          echo "   - After setup, RDP should work"
+          echo ""
+          echo "💡 Keep this workflow running to maintain access"
+          echo "=========================================="
+
+      - name: Maintain Connection
+        run: |
+          echo "🔄 VM is now running."
+          echo "To stop: Cancel this workflow run in GitHub UI."
+          echo ""
+
+          while true; do
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Windows 10 VM Active"
+            echo "   noVNC: ${{ env.NOVNC_URL }}"
+            echo "   RDP:   ${{ env.RDP_URL }}"
+            docker ps --filter name=windows10-vm --format "Container: {{.Status}}" || true
+            sleep 300
+          done
