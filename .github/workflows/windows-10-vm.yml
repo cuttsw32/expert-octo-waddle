@@ -12,19 +12,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install ngrok
+      - name: Install ngrok (Direct Binary)
         run: |
-          curl -s https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
-          echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/sources.list.d/ngrok.list
-          sudo apt update -qq
-          sudo apt install -y -qq ngrok jq
+          echo "Installing ngrok..."
+          curl -sSL https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz | tar xz
+          sudo mv ngrok /usr/local/bin/
+          ngrok version
           ngrok config add-authtoken ${{ secrets.NGROK_AUTHTOKEN }}
+          echo "✅ ngrok installed"
 
-      - name: Start Windows 10 with DIRECT RDP
+      - name: Start Windows 10 Container
         run: |
           docker rm -f win10-rdp 2>/dev/null || true
 
-          # dockurr/windows - Best for direct RDP performance
           docker run -d --name win10-rdp \
             --device /dev/kvm \
             -p 3389:3389 \
@@ -37,27 +37,57 @@ jobs:
             -e DISABLE_WEB="true" \
             dockurr/windows
 
-          echo "✅ Windows 10 started with direct RDP only"
-          sleep 25
+          echo "✅ Container started"
+          sleep 15
 
-      - name: Start ngrok RDP Tunnel Only
+      - name: Start ngrok TCP Tunnel (Very Robust)
         run: |
-          echo "Starting ngrok TCP tunnel for RDP only..."
+          echo "🚀 Starting ngrok TCP tunnel for RDP..."
 
-          ngrok tcp 3389 \
+          rm -f /tmp/ngrok.log
+
+          nohup ngrok tcp 3389 \
+            --authtoken ${{ secrets.NGROK_AUTHTOKEN }} \
             --log=stdout \
-            --region=us > /tmp/ngrok-rdp.log 2>&1 &
+            --region=us > /tmp/ngrok.log 2>&1 &
 
-          sleep 8
+          NGROK_PID=$!
+          echo "ngrok started with PID: $NGROK_PID"
 
-          for i in {1..25}; do
-            if curl -s http://127.0.0.1:4040/api/tunnels > /dev/null 2>&1; then
+          echo "Waiting for ngrok API (up to 120 seconds)..."
+
+          NGROK_READY=false
+          for i in {1..60}; do
+            sleep 2
+
+            if ! ps -p $NGROK_PID > /dev/null 2>&1; then
+              echo "ngrok process died at attempt $i"
               break
             fi
-            sleep 2
+
+            if curl -s --max-time 5 http://127.0.0.1:4040/api/tunnels >/dev/null 2>&1; then
+              NGROK_READY=true
+              echo "✅ ngrok API is ready after $((i*2)) seconds"
+              break
+            fi
           done
 
+          if [ "$NGROK_READY" = false ]; then
+            echo "❌ ngrok tunnel failed to start"
+            echo ""
+            echo "=== ngrok log (last 150 lines) ==="
+            tail -n 150 /tmp/ngrok.log || echo "No log file"
+            echo ""
+            echo "=== ngrok processes ==="
+            ps aux | grep -E '[n]grok' || true
+            exit 1
+          fi
+
+          sleep 6
+
+          echo "Fetching public RDP address..."
           TUNNELS=$(curl -s http://127.0.0.1:4040/api/tunnels)
+
           RDP_URL=$(echo "$TUNNELS" | jq -r '.tunnels[]? | select(.proto=="tcp") | .public_url' | head -1)
 
           if [ -z "$RDP_URL" ] || [ "$RDP_URL" = "null" ]; then
@@ -69,56 +99,34 @@ jobs:
           echo "RDP_URL=$RDP_URL" >> $GITHUB_ENV
           echo "RDP_HOST=$RDP_HOST" >> $GITHUB_ENV
 
-          echo "✅ RDP Tunnel ready"
-          echo "RDP: $RDP_URL"
+          echo ""
+          echo "✅ ngrok tunnel created successfully!"
+          echo "RDP Host: $RDP_HOST"
 
-      - name: Wait for Windows Boot
+      - name: Wait for Windows to Boot
         run: |
-          echo "Waiting for Windows to boot (15-30 mins first time)..."
-          sleep 180   # Give Windows time to boot properly
-          echo "Windows should be ready for direct RDP now"
+          echo "⏳ Waiting for Windows to boot (15-25 mins on first run)..."
+          sleep 300
+          echo "Boot wait finished"
 
-      - name: Show DIRECT RDP Details (No Web)
+      - name: Show DIRECT RDP Details
         run: |
           echo ""
           echo "═══════════════════════════════════════════════════════════════"
-          echo "           ✅ FULLY READY - DIRECT RDP ONLY"
+          echo "           ✅ DIRECT RDP READY (No Web)"
           echo "═══════════════════════════════════════════════════════════════"
           echo ""
-          echo "🔗 RDP COMPUTER / HOST:"
+          echo "🔗 Computer:"
           echo "   ${{ env.RDP_HOST }}"
           echo ""
-          echo "👤 USERNAME:"
-          echo "   RDP"
+          echo "👤 Username: RDP"
+          echo "🔑 Password: RdpPass123!"
           echo ""
-          echo "🔑 PASSWORD:"
-          echo "   RdpPass123!"
-          echo ""
-          echo "───────────────────────────────────────────────────────────────"
-          echo "📌 HOW TO CONNECT (Direct RDP - No Web):"
-          echo ""
-          echo "   Windows:"
-          echo "     1. Open 'Remote Desktop Connection'"
-          echo "     2. Paste exactly: ${{ env.RDP_HOST }}"
-          echo "     3. Username: RDP"
-          echo "     4. Password: RdpPass123!"
-          echo "     5. Click Connect"
-          echo ""
-          echo "   Mac / Android / iPhone:"
-          echo "     Use Microsoft Remote Desktop app"
-          echo "     Paste the address above"
-          echo ""
-          echo "───────────────────────────────────────────────────────────────"
-          echo "⚠️  First run only: May take 15-30 minutes to boot"
-          echo "   After first setup, RDP connects very fast"
-          echo ""
-          echo "💡 This is PURE RDP - no web interface used"
           echo "═══════════════════════════════════════════════════════════════"
 
-      - name: Keep Alive
+      - name: Keep VM Running
         run: |
-          echo "🔄 Direct RDP Windows 10 is running"
           while true; do
-            echo "[$(date '+%H:%M:%S')] RDP Active: ${{ env.RDP_HOST }}"
+            echo "[$(date '+%H:%M:%S')] RDP Active → ${{ env.RDP_HOST }}"
             sleep 300
           done
