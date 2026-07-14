@@ -1,4 +1,4 @@
-name: Windows 10 VM - DIRECT RDP ONLY (Pinggy - Free TCP)
+name: Windows 10 VM - DIRECT RDP ONLY (Bore - Free)
 
 on:
   workflow_dispatch:
@@ -12,10 +12,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install dependencies
+      - name: Install Bore (Free TCP Tunnel)
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq sshpass openssh-client jq
+          echo "Installing bore..."
+          curl -sL https://github.com/ekzhang/bore/releases/latest/download/bore-v0.5.1-x86_64-unknown-linux-musl.tar.gz | tar xz
+          sudo mv bore /usr/local/bin/
+          bore --version
+          echo "✅ bore installed"
 
       - name: Start Windows 10 Container
         run: |
@@ -33,48 +36,52 @@ jobs:
             -e DISABLE_WEB="true" \
             dockurr/windows
 
-          echo "✅ Windows container started"
-          sleep 20
+          echo "✅ Container started"
+          sleep 25
 
-      - name: Start Pinggy TCP Tunnel (Free - No Card Needed)
+      - name: Start Bore TCP Tunnel (Free)
         run: |
-          echo "🚀 Starting free Pinggy TCP tunnel for RDP..."
+          echo "🚀 Starting free Bore TCP tunnel for RDP..."
 
-          pkill -f "tcp@free.pinggy.io" || true
+          rm -f /tmp/bore.log
 
-          ssh -o StrictHostKeyChecking=no -o ServerAliveInterval=60 \
-            -R 0:localhost:3389 tcp@free.pinggy.io > /tmp/pinggy.log 2>&1 &
+          nohup bore local 3389 --to bore.pub > /tmp/bore.log 2>&1 &
+          BORE_PID=$!
 
-          SSH_PID=$!
-          echo "Pinggy SSH process started"
-
-          echo "Waiting for Pinggy to give us the public address (up to 60s)..."
+          echo "bore started (PID: $BORE_PID)"
+          echo "Waiting for public address (up to 120 seconds)..."
 
           RDP_HOST=""
-          for i in {1..30}; do
+          for i in {1..60}; do
             sleep 2
-            
-            if grep -q "tcp://" /tmp/pinggy.log 2>/dev/null; then
-              RDP_HOST=$(grep -o 'tcp://[^ ]*' /tmp/pinggy.log | head -1 | sed 's|tcp://||')
-              if [ -n "$RDP_HOST" ]; then
-                echo "✅ Got Pinggy address: $RDP_HOST"
-                break
-              fi
+
+            if [ -f /tmp/bore.log ]; then
+              RDP_HOST=$(grep -oE 'bore\.pub:[0-9]+' /tmp/bore.log | head -1)
+            fi
+
+            if [ -n "$RDP_HOST" ]; then
+              echo "✅ Got Bore address: $RDP_HOST"
+              break
             fi
           done
 
+          echo ""
+          echo "=== Full Bore log ==="
+          cat /tmp/bore.log || echo "(log empty)"
+          echo "====================="
+
           if [ -z "$RDP_HOST" ]; then
-            echo "❌ Failed to get Pinggy address"
-            echo "=== Pinggy log ==="
-            cat /tmp/pinggy.log
+            echo "❌ Failed to get Bore address"
+            echo ""
+            echo "=== bore processes ==="
+            ps aux | grep -E '[b]ore' || true
             exit 1
           fi
 
           echo "RDP_HOST=$RDP_HOST" >> $GITHUB_ENV
-          echo "RDP_URL=tcp://$RDP_HOST" >> $GITHUB_ENV
 
           echo ""
-          echo "✅ Free TCP tunnel ready!"
+          echo "✅ Free Bore tunnel ready!"
           echo "RDP Address: $RDP_HOST"
 
       - name: Wait for Windows to Boot
@@ -98,7 +105,7 @@ jobs:
           echo ""
           echo "═══════════════════════════════════════════════════════════════"
           echo ""
-          echo "This uses Pinggy (free TCP tunnel) - no card required"
+          echo "Pure direct RDP using Bore (free, no card, no Tailscale)"
 
       - name: Keep VM Running
         run: |
